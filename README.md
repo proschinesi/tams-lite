@@ -51,7 +51,8 @@ tams-consume --flow-id <FLOW> --timerange "[<start>_" --out - | ffplay -   # ...
 ```
 
 Install the CLIs with `pip install -e .` (Python ≥ 3.11; ffmpeg required for
-recorder and `--remux`).
+recorder and `--remux`). Full prerequisites, install paths and configuration
+are in [INSTALL.md](INSTALL.md).
 
 ## Semantics
 
