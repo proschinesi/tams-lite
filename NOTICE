@@ -1,0 +1,14 @@
+tams-lite
+Copyright 2026 proschinesi
+
+This product includes software and specifications derived from the
+AMWA Time-addressable Media Store (TAMS) project by BBC R&D:
+
+    https://github.com/bbc/tams
+    Copyright British Broadcasting Corporation
+    Licensed under the Apache License, Version 2.0
+
+Portions of this project (including API schemas and definitions such as
+source-core.json, flow-core.json and flow-segment.json) are based on, or
+modified from, files in the bbc/tams repository. Such files retain their
+original Apache-2.0 licensing and copyright.

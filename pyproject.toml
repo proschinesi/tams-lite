@@ -1,0 +1,39 @@
+[project]
+name = "tamslite"
+version = "0.1.0"
+description = "Lightweight, self-hostable BBC TAMS (v8.1) store + recorder + consumer. No Kubernetes."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "asyncpg>=0.29",
+    "boto3>=1.34",
+    "httpx>=0.27",
+    "jsonschema>=4.21",
+    "mediatimestamp>=5.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+tams-store = "tamslite.store.app:main"
+tams-record = "tamslite.recorder.main:main"
+tams-consume = "tamslite.consumer.main:main"
+tams-montage = "tamslite.montage:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"tamslite.store" = ["*.sql"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
