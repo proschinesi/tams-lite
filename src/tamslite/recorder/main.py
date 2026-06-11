@@ -1,15 +1,24 @@
 """tams-record: ingest a source, segment to immutable mpegts chunks, register in TAMS.
 
-ffmpeg's segment muxer writes ~N second .ts chunks (GOP aligned, continuity
-counters preserved across chunks). For each completed chunk we:
+The feed is recorded AS-IS: by default ffmpeg stream-copies (`-c copy`, no
+re-encode), so the bytes stored are exactly the source's coded essence, just
+re-wrapped into mpegts segments cut at the source's existing GOP boundaries.
+The Flow metadata (codec, resolution, frame rate) is *probed* from the source
+rather than assumed, so TAMS describes what was actually recorded. Re-encoding
+only happens for synthetic raw sources (`testsrc`, which has no coded essence)
+or when the user explicitly asks for it with `--encode`.
+
+ffmpeg's segment muxer writes ~N second .ts chunks; in copy mode each cut lands
+on an existing keyframe, so chunk durations follow the source GOP and are read
+back exactly per chunk via ffprobe. For each completed chunk we:
   1. take a presigned PUT url from a pre-allocated pool (POST /flows/{id}/storage)
   2. upload the bytes to the object store (TAMS never sees the media)
   3. POST the Flow Segment: timerange on the TAI wall-clock timeline + ts_offset
      mapping the chunk's internal PTS to that timeline (segment_ts = media_ts + ts_offset)
 
 Timeline model: the wall-clock TAI instant when ffmpeg starts is the anchor for
-media time 0 of the encode; chunk k covers [anchor + pts_start_k, anchor + pts_start_{k+1}),
-which keeps the flow timeline gap-free by construction.
+media time 0 of the recording; chunk k covers [anchor + pts_start_k, anchor +
+pts_start_{k+1}), which keeps the flow timeline gap-free by construction.
 """
 
 from __future__ import annotations
@@ -38,43 +47,94 @@ def probe_chunk(path: Path) -> tuple[int, int]:
     return tl.seconds_str_to_ns(fmt["start_time"]), tl.seconds_str_to_ns(fmt["duration"])
 
 
-def build_flow_doc(flow_id: str, source_id: str, label: str, args) -> dict:
+# ffmpeg codec_name -> codec MIME type for the Flow `codec` field (IANA-style).
+_CODEC_MIME = {
+    "h264": "video/h264",
+    "hevc": "video/h265",
+    "h265": "video/h265",
+    "mpeg2video": "video/mpeg2",
+    "vp8": "video/vp8",
+    "vp9": "video/vp9",
+    "av1": "video/av01",
+}
+
+
+def probe_source(source: str) -> dict:
+    """Probe the source video stream so the Flow metadata describes what is
+    actually recorded (codec, resolution, frame rate, interlacing)."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name,width,height,r_frame_rate,field_order",
+         "-of", "json", source],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    streams = json.loads(out).get("streams", [])
+    if not streams:
+        raise SystemExit(f"no video stream found in source: {source}")
+    s = streams[0]
+    num, _, den = s.get("r_frame_rate", "25/1").partition("/")
+    field = s.get("field_order", "progressive")
+    interlace = "progressive" if field in ("progressive", "", "unknown") else (
+        "interlaced_tff" if field in ("tt", "tb") else "interlaced_bff"
+    )
+    return {
+        "codec_name": s["codec_name"],
+        "width": int(s["width"]),
+        "height": int(s["height"]),
+        "rate_num": int(num),
+        "rate_den": int(den) if den else 1,
+        "interlace": interlace,
+    }
+
+
+def build_flow_doc(flow_id: str, source_id: str, label: str, params: dict, chunk: int) -> dict:
+    codec = _CODEC_MIME.get(params["codec_name"], f"video/{params['codec_name']}")
     return {
         "id": flow_id,
         "source_id": source_id,
         "label": label,
         "format": "urn:x-nmos:format:video",
-        "codec": "video/h264",
+        "codec": codec,
         "container": "video/mp2t",
         "generation": 0,
-        "segment_duration": {"numerator": args.chunk, "denominator": 1},
+        "segment_duration": {"numerator": chunk, "denominator": 1},
         "essence_parameters": {
-            "frame_width": args.width,
-            "frame_height": args.height,
-            "frame_rate": {"numerator": args.rate, "denominator": 1},
-            "interlace_mode": "progressive",
+            "frame_width": params["width"],
+            "frame_height": params["height"],
+            "frame_rate": {"numerator": params["rate_num"], "denominator": params["rate_den"]},
+            "interlace_mode": params["interlace"],
         },
         "tags": {"recorded_by": "tams-lite-recorder"},
     }
 
 
 def ffmpeg_cmd(args, outdir: Path) -> list[str]:
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
     if args.source == "testsrc":
-        src = ["-re", "-f", "lavfi",
-               "-i", f"testsrc2=size={args.width}x{args.height}:rate={args.rate}"]
+        # synthetic raw source: it has no coded essence, so it must be encoded
         if args.duration:
-            src = ["-t", str(args.duration), *src]
+            cmd += ["-t", str(args.duration)]
+        cmd += ["-re", "-f", "lavfi",
+                "-i", f"testsrc2=size={args.width}x{args.height}:rate={args.rate}"]
+        gop = args.rate * args.chunk
+        codec = ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+                 "-b:v", args.bitrate, "-g", str(gop), "-keyint_min", str(gop),
+                 "-sc_threshold", "0"]
     else:
-        src = ["-re", "-i", args.source]
+        cmd += ["-re", "-i", args.source]
         if args.duration:
-            src += ["-t", str(args.duration)]
-    gop = args.rate * args.chunk
+            cmd += ["-t", str(args.duration)]
+        if args.encode:
+            # opt-in transcode (e.g. to normalise a feed); changes the bytes
+            gop = args.rate * args.chunk
+            codec = ["-c:v", "libx264", "-preset", "veryfast",
+                     "-b:v", args.bitrate, "-g", str(gop), "-keyint_min", str(gop),
+                     "-sc_threshold", "0"]
+        else:
+            # DEFAULT: record the feed as-is — no re-encode, just re-wrap to mpegts
+            codec = ["-c", "copy"]
     return [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        *src,
-        "-an",
-        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-        "-b:v", args.bitrate, "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
+        *cmd, "-an", *codec,
         "-f", "segment", "-segment_time", str(args.chunk), "-segment_format", "mpegts",
         str(outdir / "chunk_%05d.ts"),
     ]
@@ -102,17 +162,34 @@ def main() -> None:
     ap.add_argument("--label", default="tams-lite recording")
     ap.add_argument("--chunk", type=int, default=2, help="target chunk duration, seconds")
     ap.add_argument("--duration", type=float, default=None, help="stop after N seconds")
-    ap.add_argument("--width", type=int, default=1280)
-    ap.add_argument("--height", type=int, default=720)
-    ap.add_argument("--rate", type=int, default=25)
-    ap.add_argument("--bitrate", default="2000k")
+    ap.add_argument("--encode", action="store_true",
+                    help="re-encode the feed instead of recording it as-is (default: stream-copy, no re-encode)")
+    ap.add_argument("--width", type=int, default=1280, help="testsrc / --encode only")
+    ap.add_argument("--height", type=int, default=720, help="testsrc / --encode only")
+    ap.add_argument("--rate", type=int, default=25, help="testsrc / --encode only")
+    ap.add_argument("--bitrate", default="2000k", help="testsrc / --encode only")
     args = ap.parse_args()
 
     flow_id = args.flow_id or str(uuid.uuid4())
     source_id = args.source_id or str(uuid.uuid4())
     client = TamsClient(args.tams)
 
-    client.put_flow(build_flow_doc(flow_id, source_id, args.label, args))
+    if args.source == "testsrc":
+        # synthetic source: parameters come from the CLI (we are generating it)
+        params = {"codec_name": "h264", "width": args.width, "height": args.height,
+                  "rate_num": args.rate, "rate_den": 1, "interlace": "progressive"}
+    elif args.encode:
+        # transcoding to the requested target: describe the target, not the source
+        params = {"codec_name": "h264", "width": args.width, "height": args.height,
+                  "rate_num": args.rate, "rate_den": 1, "interlace": "progressive"}
+    else:
+        # recording as-is: the Flow must describe the source's real essence
+        params = probe_source(args.source)
+        print(f"source codec: {params['codec_name']} {params['width']}x{params['height']} "
+              f"@ {params['rate_num']}/{params['rate_den']} fps (recorded as-is, no re-encode)",
+              file=sys.stderr)
+
+    client.put_flow(build_flow_doc(flow_id, source_id, args.label, params, args.chunk))
     print(f"flow:   {flow_id}\nsource: {source_id}", file=sys.stderr)
 
     pool = ObjectPool(client, flow_id)

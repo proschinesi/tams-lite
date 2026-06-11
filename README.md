@@ -9,7 +9,7 @@ Three components:
 | component | what it does |
 |---|---|
 | **store** (`tams-store`) | the minimal TAMS v8.1 API subset: `PUT /flows/{id}`, `POST /flows/{id}/storage`, `POST`/`GET /flows/{id}/segments` with timerange + cursor paging. Media bytes live in MinIO; TAMS holds only time-addressable metadata. |
-| **recorder** (`tams-record`) | ingests a source (file, URL, or `testsrc`), segments it into immutable ~2s mpegts chunks with ffmpeg, uploads them via presigned PUT and registers Flow Segments on the TAI timeline. |
+| **recorder** (`tams-record`) | ingests a source (file, URL, or `testsrc`) and records it **as-is** — stream-copy (`-c copy`, no re-encode) into immutable ~2s mpegts chunks cut at the source's own GOP boundaries; Flow metadata (codec, resolution, frame rate) is probed from the source. Uploads via presigned PUT and registers Flow Segments on the TAI timeline. (`testsrc` is synthetic raw so it is encoded; `--encode` opts into transcoding a real feed.) |
 | **consumer** (`tams-consume`) | the streaming resolver: given a Flow + timerange it reads segments from TAMS and pours mpegts bytes to a sink — file, stdout pipe, or HTTP — **without ever copying media into new storage** (edit-by-reference). |
 
 Plus `tams-montage`: builds a new Flow *by reference* from clips of existing Flows —
